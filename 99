@@ -1,0 +1,871 @@
+--// INF SAPLING - Ultimate UI v1.0 //--
+-- Features:
+-- Draggable, tabbed UI (Main / Misc / Autofarm)
+-- Keybind changer with safe defaults + save to getgenv
+-- Notifications (top-right)
+-- Robust planting functions (same as original)
+-- Ignores Roblox menu, textbox focus, and Alt+F4
+-- Reset config / Reset UI pos / Unload
+--
+-- NEW FEATURE: Integrated Walkspeed functionality from the other script.
+-- NEW FEATURE: Rejoin button added to Misc tab.
+-- NEW FEATURE: Increased GUI size for better button spacing.
+-- NEW FEATURE: Credits tab added.
+
+-- Services
+local Players = game:GetService('Players')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local UserInputService = game:GetService('UserInputService')
+local GuiService = game:GetService('GuiService')
+local TweenService = game:GetService('TweenService')
+local Debris = game:GetService('Debris')
+local TeleportService = game:GetService('TeleportService') -- Added service
+
+local player = Players.LocalPlayer
+local PlayerGui = player:WaitForChild('PlayerGui')
+
+-- create ScreenGui to hold everything
+local screenGui = Instance.new('ScreenGui')
+screenGui.Name = 'InfSapling_ScreenGui'
+screenGui.IgnoreGuiInset = true
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+screenGui.Parent = PlayerGui
+
+-- Defaults
+local defaultKeybinds = {
+    MenuToggle = Enum.KeyCode.LeftAlt,
+    TogglePlant = Enum.KeyCode.Q,
+    WalkSpeedToggle = Enum.KeyCode.C,
+}
+
+-- Safe ENV + SAVE
+local gEnv = (getgenv and getgenv()) or {}
+if setgenv then
+    setgenv(gEnv)
+end
+gEnv.INF_SAPLING_SAVE = gEnv.INF_SAPLING_SAVE or {}
+local SAVE = gEnv.INF_SAPLING_SAVE
+
+-- ensure keys exist & heal
+SAVE.Keybinds = SAVE.Keybinds or {}
+for k, v in pairs(defaultKeybinds) do
+    if SAVE.Keybinds[k] == nil then
+        SAVE.Keybinds[k] = v
+    end
+end
+SAVE.Mode = SAVE.Mode or 'Circle'
+SAVE.UIPos = SAVE.UIPos or { X = 0.3, Y = 0.3 }
+SAVE.NotifyDuration = SAVE.NotifyDuration or 3
+
+-- Planting settings (same as your base)
+local SAPLING_NAME = 'sapling'
+local PLANT_COUNT = 75
+local PLANT_DISTANCE = 44
+local SHOW_BLUEPRINT = true
+local BETWEEN_PLANT_WAIT = 0.06
+local MARKER_LIFETIME = 6
+local START_CFRAME = CFrame.new(-1.3, 2, -1.5)
+
+-- Walkspeed settings
+local walkSpeedEnabled = false
+local originalWalkSpeed = 16
+local currentWalkSpeed = 50 -- default walkspeed value
+local humanoid = nil
+
+-- runtime vars
+local autoPlant = false
+local planting = false
+local PLANT_MODE = 'Circle' -- Hardcoded to Circle
+local isUnloaded = false
+local listeningForBind = nil
+local connections = {}
+
+-- helper to register connections for cleanup
+local function connect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(connections, conn)
+    return conn
+end
+
+-- Notification container (top-right)
+local notifContainer = Instance.new('Frame')
+notifContainer.Name = 'NotifContainer'
+notifContainer.Size = UDim2.new(0, 320, 0, 300)
+notifContainer.Position = UDim2.new(1, -10, 0, 10)
+notifContainer.AnchorPoint = Vector2.new(1, 0)
+notifContainer.BackgroundTransparency = 1
+notifContainer.Parent = screenGui
+
+local notifLayout = Instance.new('UIListLayout', notifContainer)
+notifLayout.SortOrder = Enum.SortOrder.LayoutOrder
+notifLayout.Padding = UDim.new(0, 8)
+notifLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local notifCounter = 0
+local function createNotification(text, duration)
+    if isUnloaded then
+        return
+    end
+    duration = duration or SAVE.NotifyDuration or 3
+    notifCounter = notifCounter + 1
+
+    local frame = Instance.new('Frame')
+    frame.Size = UDim2.new(1, 0, 0, 44)
+    frame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    frame.BorderSizePixel = 0
+    frame.LayoutOrder = notifCounter
+    frame.AutoLocalize = false
+    frame.Parent = notifContainer
+
+    local corner = Instance.new('UICorner', frame)
+    corner.CornerRadius = UDim.new(0, 6)
+
+    local stroke = Instance.new('UIStroke', frame)
+    stroke.Color = Color3.fromRGB(60, 60, 60)
+    stroke.Thickness = 1
+
+    local label = Instance.new('TextLabel', frame)
+    label.Size = UDim2.new(1, -20, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 14
+    label.TextColor3 = Color3.fromRGB(230, 230, 230)
+    label.Text = text
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.AutoLocalize = false
+
+    -- fade in
+    frame.BackgroundTransparency = 1
+    label.TextTransparency = 1
+    TweenService
+        :Create(frame, TweenInfo.new(0.22), { BackgroundTransparency = 0.08 })
+        :Play()
+    TweenService:Create(label, TweenInfo.new(0.22), { TextTransparency = 0 })
+        :Play()
+
+    -- auto remove
+    task.delay(duration, function()
+        if frame and frame.Parent then
+            TweenService
+                :Create(
+                    frame,
+                    TweenInfo.new(0.18),
+                    { BackgroundTransparency = 1 }
+                )
+                :Play()
+            TweenService
+                :Create(label, TweenInfo.new(0.18), { TextTransparency = 1 })
+                :Play()
+            task.wait(0.2)
+            if frame and frame.Parent then
+                frame:Destroy()
+            end
+        end
+    end)
+end
+
+-- Planting network helpers (robust)
+local function findPlantRemote()
+    if isUnloaded then
+        return nil
+    end
+    if ReplicatedStorage:FindFirstChild('RemoteEvents') then
+        local r =
+            ReplicatedStorage.RemoteEvents:FindFirstChild('RequestPlantItem')
+        if r then
+            return r
+        end
+    end
+    if ReplicatedStorage:FindFirstChild('RequestPlantItem') then
+        return ReplicatedStorage.RequestPlantItem
+    end
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj.Name:lower() == 'requestplantitem' then
+            return obj
+        end
+    end
+    return nil
+end
+local PlantRemote = findPlantRemote()
+
+local function findSaplingInstance()
+    if isUnloaded then
+        return nil
+    end
+    local items = workspace:FindFirstChild('Items')
+    if items then
+        for _, c in ipairs(items:GetChildren()) do
+            if c.Name:lower():find(SAPLING_NAME:lower()) then
+                return c
+            end
+        end
+    end
+    for _, c in ipairs(ReplicatedStorage:GetDescendants()) do
+        if
+            (c:IsA('Model') or c:IsA('Tool'))
+            and c.Name:lower():find(SAPLING_NAME:lower())
+        then
+            return c
+        end
+    end
+    local backpack = player:FindFirstChild('Backpack')
+    local inv = player:FindFirstChild('Inventory')
+    for _, cont in ipairs({ backpack, inv }) do
+        if cont then
+            for _, c in ipairs(cont:GetChildren()) do
+                if c.Name:lower():find(SAPLING_NAME:lower()) then
+                    return c
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function getGroundY(xzPos, defaultY)
+    if isUnloaded then
+        return nil
+    end
+    local origin = Vector3.new(xzPos.X, (defaultY or xzPos.Y) + 50, xzPos.Z)
+    local rayDir = Vector3.new(0, -200, 0)
+    local rp = RaycastParams.new()
+    rp.FilterDescendantsInstances = { player.Character or player }
+    rp.FilterType = Enum.RaycastFilterType.Blacklist
+    local res = workspace:Raycast(origin, rayDir, rp)
+    if res and res.Position then
+        return res.Position.Y
+    end
+    return defaultY or xzPos.Y
+end
+
+local function createMarker(pos)
+    if isUnloaded or not SHOW_BLUEPRINT then
+        return
+    end
+    local p = Instance.new('Part')
+    p.Size = Vector3.new(1, 1, 1)
+    p.Anchored = true
+    p.CanCollide = false
+    p.Transparency = 0.45
+    p.Color = Color3.fromRGB(45, 200, 45)
+    p.Name = 'SaplingMarker'
+    p.CFrame = CFrame.new(pos + Vector3.new(0, 0.5, 0))
+    p.Parent = workspace
+    Debris:AddItem(p, MARKER_LIFETIME)
+end
+
+local function tryCallRemote(remote, argTable)
+    if isUnloaded or not remote then
+        return false
+    end
+    if remote.ClassName == 'RemoteFunction' or remote.InvokeServer then
+        local ok = pcall(function()
+            remote:InvokeServer(unpack(argTable))
+        end)
+        return ok
+    end
+    if remote.ClassName == 'RemoteEvent' or remote.FireServer then
+        local ok = pcall(function()
+            remote:FireServer(unpack(argTable))
+        end)
+        return ok
+    end
+    return false
+end
+
+local function robustPlantCall(remote, saplingArg, position)
+    if isUnloaded or not remote then
+        return false
+    end
+    local attempts = {
+        { saplingArg, position },
+        { position, saplingArg },
+        { tostring(saplingArg), position },
+        { position, tostring(saplingArg) },
+    }
+    for _, args in ipairs(attempts) do
+        if tryCallRemote(remote, args) then
+            return true
+        end
+        task.wait(0.03)
+    end
+    return false
+end
+
+local function plantCircle(centerPos, count, distance)
+    if isUnloaded then
+        return
+    end
+    local sapInst = findSaplingInstance()
+    local firstArg = sapInst or SAPLING_NAME
+    for i = 1, math.max(1, count) do
+        if not autoPlant or isUnloaded then
+            break
+        end
+        local angle = (2 * math.pi / count) * (i - 1)
+        local x = centerPos.X + math.cos(angle) * distance
+        local z = centerPos.Z + math.sin(angle) * distance
+        local groundY = getGroundY(Vector3.new(x, centerPos.Y, z), centerPos.Y)
+        local finalPos = Vector3.new(x, groundY, z)
+        createMarker(finalPos)
+        robustPlantCall(PlantRemote, firstArg, finalPos)
+        task.wait(BETWEEN_PLANT_WAIT)
+    end
+end
+
+local function plantFromStart(mode)
+    if isUnloaded then
+        return
+    end
+    local originPos = START_CFRAME.Position
+    plantCircle(originPos, PLANT_COUNT, PLANT_DISTANCE)
+end
+
+-- GUI: Main container
+local mainFrame = Instance.new('Frame')
+mainFrame.Name = 'InfSapling_Main'
+mainFrame.Size = UDim2.new(0, 600, 0, 480) -- Increased size
+mainFrame.Position = UDim2.new(SAVE.UIPos.X, 0, SAVE.UIPos.Y, 0)
+mainFrame.AnchorPoint = Vector2.new(0, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = screenGui -- Fix: Moved parent assignment before making it visible
+
+-- Fix: Ensure the GUI is visible from the start
+mainFrame.Visible = true
+
+local mainCorner = Instance.new('UICorner', mainFrame)
+mainCorner.CornerRadius = UDim.new(0, 10)
+
+local mainStroke = Instance.new('UIStroke', mainFrame)
+mainStroke.Color = Color3.fromRGB(40, 40, 40)
+mainStroke.Thickness = 2
+
+-- Save config function (needs mainFrame defined)
+local function SaveConfig()
+    if isUnloaded then
+        return
+    end
+    SAVE.Keybinds = SAVE.Keybinds
+    SAVE.Mode = PLANT_MODE
+    -- Save UI position as scale (best effort)
+    local pos = mainFrame.Position
+    SAVE.UIPos = {
+        X = pos.X.Scale
+            or pos.X.Offset / workspace.CurrentCamera.ViewportSize.X,
+        Y = pos.Y.Scale
+            or pos.Y.Offset / workspace.CurrentCamera.ViewportSize.Y,
+    }
+    -- commit back to global
+    gEnv.INF_SAPLING_SAVE = SAVE
+end
+
+-- Notification: helpful wrapper for internal events
+local function notify(text, duration)
+    pcall(function()
+        createNotification(text, duration)
+    end)
+end
+
+-- Top bar (title + close)
+local topBar = Instance.new('Frame', mainFrame)
+topBar.Size = UDim2.new(1, 0, 0, 36)
+topBar.Position = UDim2.new(0, 0, 0, 0)
+topBar.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+topBar.BorderSizePixel = 0
+
+local topCorner = Instance.new('UICorner', topBar)
+topCorner.CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new('TextLabel', topBar)
+title.Size = UDim2.new(1, -70, 1, 0)
+title.Position = UDim2.new(0, 18, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = '🌱 INF SAPLING | V4'
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextColor3 = Color3.fromRGB(210, 210, 210)
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local closeBtn = Instance.new('TextButton', topBar)
+closeBtn.Size = UDim2.new(0, 36, 1, 0)
+closeBtn.Position = UDim2.new(1, -40, 0, 0)
+closeBtn.BackgroundTransparency = 1
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.Text = 'X'
+closeBtn.TextColor3 = Color3.fromRGB(255, 120, 120)
+closeBtn.TextSize = 18
+closeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = false
+    SaveConfig()
+    notify('GUI closed', 1.5)
+end)
+
+-- dragging
+local dragging = false
+local dragStart, originPos
+topBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        originPos = mainFrame.Position
+    end
+end)
+topBar.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+        SaveConfig()
+    end
+end)
+connect(UserInputService.InputChanged, function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(
+            originPos.X.Scale,
+            originPos.X.Offset + delta.X,
+            originPos.Y.Scale,
+            originPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- layout (tabs)
+local tabBar = Instance.new('Frame', mainFrame)
+tabBar.Size = UDim2.new(0, 120, 1, -36)
+tabBar.Position = UDim2.new(0, 0, 0, 36)
+tabBar.BackgroundColor3 = Color3.fromRGB(26, 26, 26)
+tabBar.BorderSizePixel = 0
+
+local tabLayout = Instance.new('UIListLayout', tabBar)
+tabLayout.Padding = UDim.new(0, 6)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local contentArea = Instance.new('Frame', mainFrame)
+contentArea.Size = UDim2.new(1, -120, 1, -36)
+contentArea.Position = UDim2.new(0, 120, 0, 36)
+contentArea.BackgroundTransparency = 1
+
+-- pages
+local pageMain = Instance.new('Frame', contentArea)
+pageMain.Size = UDim2.new(1, 0, 1, 0)
+pageMain.BackgroundTransparency = 1
+
+local mainLayout = Instance.new('UIListLayout', pageMain)
+mainLayout.Padding = UDim.new(0, 6)
+mainLayout.SortOrder = Enum.SortOrder.LayoutOrder
+mainLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+mainLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local mainPadding = Instance.new('UIPadding', pageMain)
+mainPadding.PaddingTop = UDim.new(0, 12)
+
+local pageMisc = Instance.new('Frame', contentArea)
+pageMisc.Size = UDim2.new(1, 0, 1, 0)
+pageMisc.BackgroundTransparency = 1
+pageMisc.Visible = false
+
+local miscLayout = Instance.new('UIListLayout', pageMisc)
+miscLayout.Padding = UDim.new(0, 6)
+miscLayout.SortOrder = Enum.SortOrder.LayoutOrder
+miscLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+miscLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+
+local miscPadding = Instance.new('UIPadding', pageMisc)
+miscPadding.PaddingTop = UDim.new(0, 12)
+
+local pageCredits = Instance.new('Frame', contentArea)
+pageCredits.Size = UDim2.new(1, 0, 1, 0)
+pageCredits.BackgroundTransparency = 1
+pageCredits.Visible = false
+
+local creditsLayout = Instance.new('UIListLayout', pageCredits)
+creditsLayout.Padding = UDim.new(0, 6)
+creditsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+creditsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+creditsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+
+-- small helper to create tab buttons
+local function makeTab(text, page)
+    local btn = Instance.new('TextButton', tabBar)
+    btn.Size = UDim2.new(1, -12, 0, 44)
+    btn.AutoLocalize = false
+    btn.Text = text
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 15
+    btn.TextColor3 = Color3.fromRGB(210, 210, 210)
+    btn.BackgroundColor3 = Color3.fromRGB(37, 37, 37)
+    btn.BorderSizePixel = 0
+    local corner = Instance.new('UICorner', btn)
+    corner.CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(function()
+        pageMain.Visible = (page == pageMain)
+        pageMisc.Visible = (page == pageMisc)
+        pageCredits.Visible = (page == pageCredits)
+    end)
+    return btn
+end
+
+makeTab('Main', pageMain)
+makeTab('Misc', pageMisc)
+makeTab('Credits', pageCredits)
+
+-- Main page UI (status + mode + buttons)
+local statusLabel = Instance.new('TextLabel', pageMain)
+statusLabel.Size = UDim2.new(1, -20, 0, 28)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextSize = 18
+statusLabel.Text = 'Planting: OFF'
+statusLabel.TextColor3 = Color3.fromRGB(200, 0, 0)
+statusLabel.AutoLocalize = false
+
+local modeLabel = Instance.new('TextLabel', pageMain)
+modeLabel.Size = UDim2.new(1, -20, 0, 24)
+modeLabel.BackgroundTransparency = 1
+modeLabel.Font = Enum.Font.GothamBold
+modeLabel.TextSize = 16
+modeLabel.Text = 'Mode: Circle'
+modeLabel.TextColor3 = Color3.fromRGB(0, 200, 255)
+modeLabel.AutoLocalize = false
+
+-- helper to make centered buttons in a page
+local function makeButton(parent, text, callback)
+    local btn = Instance.new('TextButton', parent)
+    btn.Size = UDim2.new(0, 420, 0, 40) -- Adjusted for new size
+    btn.Text = text
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 16
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+    btn.BorderSizePixel = 0
+    local corner = Instance.new('UICorner', btn)
+    corner.CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(function()
+        if isUnloaded then
+            return
+        end
+        callback()
+    end)
+    return btn
+end
+
+local function toggleWalkspeed()
+    walkSpeedEnabled = not walkSpeedEnabled
+    if walkSpeedEnabled then
+        if humanoid then
+            humanoid.WalkSpeed = currentWalkSpeed
+        end
+        notify('Walkspeed enabled')
+    else
+        if humanoid then
+            humanoid.WalkSpeed = originalWalkSpeed
+        end
+        notify('Walkspeed disabled')
+    end
+end
+
+local wsToggleBtn = makeButton(pageMain, 'Toggle Walkspeed', toggleWalkspeed)
+
+local wsTextBox = Instance.new('TextBox', pageMain)
+wsTextBox.Size = UDim2.new(0, 420, 0, 40) -- Adjusted for new size
+wsTextBox.PlaceholderText = 'Enter speed (e.g., 50)'
+wsTextBox.Text = tostring(currentWalkSpeed)
+wsTextBox.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+wsTextBox.Font = Enum.Font.GothamBold
+wsTextBox.TextSize = 16
+wsTextBox.TextColor3 = Color3.fromRGB(240, 240, 240)
+local wsTextBoxCorner = Instance.new('UICorner', wsTextBox)
+wsTextBoxCorner.CornerRadius = UDim.new(0, 6)
+
+wsTextBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        local newSpeed = tonumber(wsTextBox.Text)
+        if newSpeed and newSpeed > 0 then
+            currentWalkSpeed = newSpeed
+            if walkSpeedEnabled and humanoid then
+                humanoid.WalkSpeed = currentWalkSpeed
+            end
+            notify('Walkspeed set to ' .. newSpeed)
+        else
+            notify('Invalid speed. Try again.')
+        end
+    end
+end)
+
+local toggleBtn = makeButton(pageMain, 'Toggle Planting', function()
+    autoPlant = not autoPlant
+    statusLabel.Text = autoPlant and 'Planting: ON' or 'Planting: OFF'
+    statusLabel.TextColor3 = autoPlant and Color3.fromRGB(0, 200, 0)
+        or Color3.fromRGB(200, 0, 0)
+    notify('Planting ' .. (autoPlant and 'enabled' or 'disabled'))
+    if autoPlant and not planting then
+        planting = true
+        task.spawn(function()
+            while autoPlant and not isUnloaded do
+                plantFromStart(PLANT_MODE)
+                task.wait(0.5)
+            end
+            planting = false
+        end)
+    end
+end)
+
+-- Misc page UI
+local miscTitle = Instance.new('TextLabel', pageMisc)
+miscTitle.Size = UDim2.new(1, -20, 0, 28)
+miscTitle.BackgroundTransparency = 1
+miscTitle.Font = Enum.Font.GothamBold
+miscTitle.TextSize = 18
+miscTitle.Text = 'Misc Settings'
+miscTitle.TextColor3 = Color3.fromRGB(210, 210, 210)
+miscTitle.AutoLocalize = false
+
+local unloadBtn = makeButton(pageMisc, 'Unload Script', function()
+    -- clean unload
+    isUnloaded = true
+    autoPlant = false
+    walkSpeedEnabled = false
+    if humanoid then
+        humanoid.WalkSpeed = originalWalkSpeed
+    end
+    for _, c in ipairs(connections) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    notify('Unloaded Inf Sapling', 2)
+    task.wait(0.1)
+    if screenGui and screenGui.Parent then
+        screenGui:Destroy()
+    end
+end)
+
+-- Rejoin Button
+local rejoinBtn = makeButton(pageMisc, 'Rejoin Game', function()
+    local success, message = pcall(function()
+        -- Rejoin teleport requires the player instance as the second argument
+        TeleportService:Teleport(game.PlaceId, player)
+    end)
+    if not success then
+        notify('Rejoin failed: ' .. message)
+    end
+end)
+
+local resetPosBtn = makeButton(pageMisc, 'Reset UI Position', function()
+    mainFrame.Position = UDim2.new(0.3, 0, 0.3, 0)
+    SAVE.UIPos = { X = 0.3, Y = 0.3 }
+    SaveConfig()
+    notify('UI position reset', 1.5)
+end)
+
+local resetConfigBtn = makeButton(
+    pageMisc,
+    'Reset Config (Keybinds/Mode)',
+    function()
+        SAVE.Keybinds = {
+            MenuToggle = defaultKeybinds.MenuToggle,
+            TogglePlant = defaultKeybinds.TogglePlant,
+            WalkSpeedToggle = defaultKeybinds.WalkSpeedToggle,
+        }
+        PLANT_MODE = 'Circle'
+        modeLabel.Text = 'Mode: Circle'
+        modeLabel.TextColor3 = Color3.fromRGB(0, 200, 255)
+        SaveConfig()
+        refreshKeyButtons()
+        notify('Config reset to defaults', 2)
+    end
+)
+
+-- Keybind editor UI (in Misc)
+local keybindHeader = Instance.new('TextLabel', pageMisc)
+keybindHeader.Size = UDim2.new(1, -20, 0, 24)
+keybindHeader.BackgroundTransparency = 1
+keybindHeader.Font = Enum.Font.Gotham
+keybindHeader.TextSize = 14
+keybindHeader.Text = 'Change Keybinds:'
+keybindHeader.TextColor3 = Color3.fromRGB(200, 200, 200)
+keybindHeader.AutoLocalize = false
+
+local function safeKeyName(k)
+    if not k then
+        return 'None'
+    end
+    if typeof(k) == 'EnumItem' then
+        return k.Name
+    end
+    return tostring(k)
+end
+
+local keyBtnTogglePlant, keyBtnMenu, keyBtnWalkspeed
+local function makeKeybindButton(parent, action)
+    local btn = Instance.new('TextButton', parent)
+    btn.Size = UDim2.new(0, 420, 0, 36) -- Adjusted for new size
+    btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 14
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    local corner = Instance.new('UICorner', btn)
+    corner.CornerRadius = UDim.new(0, 6)
+    local keyObj = SAVE.Keybinds[action]
+    btn.Text = action .. ': ' .. safeKeyName(keyObj)
+    btn.AutoLocalize = false
+    btn.MouseButton1Click:Connect(function()
+        if isUnloaded then
+            return
+        end
+        btn.Text = action .. ': ' .. '...'
+        listeningForBind = action
+        notify('Press a key to set ' .. action, 2)
+    end)
+    return btn
+end
+
+keyBtnTogglePlant = makeKeybindButton(pageMisc, 'TogglePlant')
+keyBtnWalkspeed = makeKeybindButton(pageMisc, 'WalkSpeedToggle')
+keyBtnMenu = makeKeybindButton(pageMisc, 'MenuToggle')
+
+-- Credits page UI
+local creditsTitle = Instance.new('TextLabel', pageCredits)
+creditsTitle.Size = UDim2.new(1, 0, 0, 40)
+creditsTitle.BackgroundTransparency = 1
+creditsTitle.Font = Enum.Font.GothamBold
+creditsTitle.TextSize = 24
+creditsTitle.Text = 'Credits'
+creditsTitle.TextColor3 = Color3.fromRGB(210, 210, 210)
+creditsTitle.AutoLocalize = false
+
+local creditsLabel = Instance.new('TextLabel', pageCredits)
+creditsLabel.Size = UDim2.new(1, 0, 0, 30)
+creditsLabel.BackgroundTransparency = 1
+creditsLabel.Font = Enum.Font.GothamBold
+creditsLabel.TextSize = 20
+creditsLabel.Text = 'Uhxul'
+creditsLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+creditsLabel.AutoLocalize = false
+
+-- Update key button texts helper (call after changes)
+local function refreshKeyButtons()
+    if keyBtnTogglePlant then
+        keyBtnTogglePlant.Text = 'TogglePlant: '
+            .. safeKeyName(SAVE.Keybinds.TogglePlant)
+    end
+    if keyBtnWalkspeed then
+        keyBtnWalkspeed.Text = 'WalkSpeedToggle: '
+            .. safeKeyName(SAVE.Keybinds.WalkSpeedToggle)
+    end
+    if keyBtnMenu then
+        keyBtnMenu.Text = 'MenuToggle: '
+            .. safeKeyName(SAVE.Keybinds.MenuToggle)
+    end
+end
+
+-- Input listener
+local function onInputBegan(input, gameProcessed)
+    if isUnloaded then
+        return
+    end
+    if gameProcessed then
+        return
+    end
+    if GuiService and GuiService.MenuIsOpen then
+        return
+    end
+    if UserInputService:GetFocusedTextBox() then
+        return
+    end
+
+    if listeningForBind then
+        local action = listeningForBind
+        listeningForBind = nil
+        if input.KeyCode and input.KeyCode ~= Enum.KeyCode.Unknown then
+            SAVE.Keybinds[action] = input.KeyCode
+            SaveConfig()
+            refreshKeyButtons()
+            notify(action .. ' set to ' .. safeKeyName(input.KeyCode), 2)
+        else
+            notify('Invalid key - try again', 1.4)
+        end
+        return
+    end
+
+    if
+        input.KeyCode == Enum.KeyCode.F4
+        and (
+            UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt)
+            or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+        )
+    then
+        return
+    end
+
+    if input.KeyCode == SAVE.Keybinds.TogglePlant then
+        autoPlant = not autoPlant
+        statusLabel.Text = autoPlant and 'Planting: ON' or 'Planting: OFF'
+        statusLabel.TextColor3 = autoPlant and Color3.fromRGB(0, 200, 0)
+            or Color3.fromRGB(200, 0, 0)
+        notify('Planting ' .. (autoPlant and 'enabled' or 'disabled'))
+        if autoPlant and not planting then
+            planting = true
+            task.spawn(function()
+                while autoPlant and not isUnloaded do
+                    plantFromStart(PLANT_MODE)
+                    task.wait(0.5)
+                end
+                planting = false
+            end)
+        end
+        return
+    end
+
+    if input.KeyCode == SAVE.Keybinds.WalkSpeedToggle then
+        toggleWalkspeed()
+        return
+    end
+
+    if input.KeyCode == SAVE.Keybinds.MenuToggle then
+        mainFrame.Visible = not mainFrame.Visible
+        SaveConfig()
+        return
+    end
+end
+
+-- Connections
+connect(UserInputService.InputBegan, onInputBegan)
+
+local function onCharacterAdded(char)
+    humanoid = char:FindFirstChildOfClass('Humanoid')
+    if humanoid then
+        originalWalkSpeed = humanoid.WalkSpeed
+        if walkSpeedEnabled then
+            humanoid.WalkSpeed = currentWalkSpeed
+        end
+    end
+end
+
+if player.Character then
+    onCharacterAdded(player.Character)
+end
+player.CharacterAdded:Connect(onCharacterAdded)
+
+-- Make sure UI reflects current SAVE
+local function updateStatusAndMode()
+    statusLabel.Text = autoPlant and 'Planting: ON' or 'Planting: OFF'
+    statusLabel.TextColor3 = autoPlant and Color3.fromRGB(0, 200, 0)
+        or Color3.fromRGB(200, 0, 0)
+    modeLabel.Text = 'Mode: Circle'
+    modeLabel.TextColor3 = Color3.fromRGB(0, 200, 255)
+    refreshKeyButtons()
+end
+
+-- finalize and show initial notification
+updateStatusAndMode()
+notify('Inf Sapling GUI - made by Uhxul', 3)
+
+-- Print to console
+print(
+    '🌱 Inf Sapling UI v4 loaded. Keybinds saved in getgenv().INF_SAPLING_SAVE'
+)
